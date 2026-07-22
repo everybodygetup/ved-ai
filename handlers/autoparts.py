@@ -4,6 +4,13 @@ from aiogram.fsm.context import FSMContext
 
 from states.import_state import ImportState
 
+from data.messages import (
+    ASK_COUNTRY,
+    ASK_COMPANY,
+    ASK_PRODUCT,
+    SUMMARY,
+)
+
 router = Router()
 
 
@@ -12,9 +19,7 @@ async def autoparts_handler(message: Message, state: FSMContext):
 
     await state.set_state(ImportState.country)
 
-    await message.answer(
-        "🌍 Из какой страны планируется импорт?"
-    )
+    await message.answer(ASK_COUNTRY)
 
 @router.message(ImportState.country)
 async def process_country(message: Message, state: FSMContext):
@@ -23,10 +28,7 @@ async def process_country(message: Message, state: FSMContext):
 
     await state.set_state(ImportState.company_type)
 
-    await message.answer(
-        "🏢 Кто является получателем?\n\n"
-        "ООО / ИП / Физическое лицо"
-    )
+    await message.answer(ASK_COMPANY)
 
 @router.message(ImportState.company_type)
 async def process_company(message: Message, state: FSMContext):
@@ -35,9 +37,7 @@ async def process_company(message: Message, state: FSMContext):
 
     await state.set_state(ImportState.product)
 
-    await message.answer(
-        "📦 Какой товар планируется импортировать?"
-    )
+    await message.answer(ASK_PRODUCT)
 
 @router.message(ImportState.product)
 async def process_product(message: Message, state: FSMContext):
@@ -47,10 +47,7 @@ async def process_product(message: Message, state: FSMContext):
     data = await state.get_data()
 
     await message.answer(
-        f"""
-✅ Спасибо!
-
-Вот что я получил:
+    f"""{SUMMARY}
 
 🌍 Страна: {data["country"]}
 
@@ -58,9 +55,7 @@ async def process_product(message: Message, state: FSMContext):
 
 📦 Товар: {data["product"]}
 """
-    )
-
-    await state.clear()
+)
 
 
 async def autoparts_handler(message: Message):
