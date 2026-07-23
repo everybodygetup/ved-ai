@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import LinkPreviewOptions
+from services.llm import ask_document_llm
 
 from monitoring.document_reader import (
     AltaDocumentDetails,
@@ -22,7 +23,7 @@ from monitoring.storage import (
     initialize_monitor_database,
     save_new_documents,
 )
-from services.llm import ask_llm
+from services.llm import ask_document_llm
 
 
 logger = logging.getLogger(__name__)
@@ -224,7 +225,7 @@ async def _build_notification(
     )
 
     try:
-        digest = await ask_llm(prompt)
+        digest = await ask_document_llm(prompt)
 
     except Exception:
         logger.exception(
@@ -232,10 +233,11 @@ async def _build_notification(
         )
 
         digest = (
-            "Найдены новые документы в Таможенном "
-            "календаре Alta.\n\n"
-            "AI-анализ временно недоступен. "
-            "Проверьте документы по ссылкам ниже."
+            "AI-анализ документа временно недоступен.\n\n"
+            "Ниже приведены только фактические сведения, "
+            "извлечённые из Таможенного календаря Alta. "
+            "Содержание документа необходимо проверить "
+            "по первоисточнику."
         )
 
     if len(digest) > 2800:

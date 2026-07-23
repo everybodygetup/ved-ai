@@ -23,15 +23,49 @@ REQUEST_HEADERS: Final[dict[str, str]] = {
     "Accept": (
         "text/html,"
         "application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
+        "application/xml;q=0.9,"
+        "*/*;q=0.8"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+    "Connection": "close",
 }
+
+
+KNOWN_STATUSES: Final[dict[str, str]] = {
+    "документ действует": "Документ действует",
+    "документ не действует": "Документ не действует",
+    "документ частично не действует": (
+        "Документ частично не действует"
+    ),
+    "статус не определен": "Статус не определён",
+    "статус не определён": "Статус не определён",
+}
+
+
+# Тексты интерфейса Alta, которые нельзя принимать
+# за статус или дату вступления в силу.
+SERVICE_LABELS: Final[set[str]] = {
+    "история статусов",
+    "статус документа",
+    "информация о статусе документа",
+    "подробная информация о датах и статусах документа",
+    "таможенный календарь",
+    "добавлен в базу",
+    "скачать документ",
+    "печатная версия",
+    "предыдущий документ",
+    "следующий документ",
+}
+
+
+DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b\d{2}\.\d{2}\.\d{4}\b"
+)
 
 
 @dataclass(slots=True, frozen=True)
 class AltaDocumentDetails:
-    """Сведения, извлечённые со страницы документа."""
+    """Сведения, извлечённые со страницы документа Alta."""
 
     source_id: str
     title: str
@@ -51,12 +85,12 @@ async def fetch_documents_details(
     documents: list[AltaDocument],
     max_documents: int = 10,
 ) -> list[AltaDocumentDetails]:
-    """
-    Загружает страницы нескольких документов.
+    """Загружает подробности нескольких документов."""
 
-    Одновременно открывается не более трёх страниц,
-    чтобы не создавать лишнюю нагрузку на Alta.
-    """
+    selected_documents = documents[:max_documents]
+
+    if not selected_documents:
+        return []
 
     semaphore = asyncio.Semaphore(3)
 
@@ -83,7 +117,7 @@ async def fetch_documents_details(
                 calendar_link=document.calendar_link,
                 calendar_summary=document.summary,
                 status="Не удалось определить",
-                effective_date="Не удалось определить",
+                effective_date="Не удалось подтвердить",
                 text_excerpt=document.summary,
                 extraction_error=(
                     f"{type(error).__name__}: {error}"
@@ -92,7 +126,7 @@ async def fetch_documents_details(
 
     tasks = [
         load_one(document)
-        for document in documents[:max_documents]
+        for document in selected_documents
     ]
 
     return list(
@@ -102,9 +136,9 @@ async def fetch_documents_details(
 
 async def fetch_document_details(
     document: AltaDocument,
-    max_text_chars: int = 3500,
+    max_text_chars: int = 5000,
 ) -> AltaDocumentDetails:
-    """Открывает страницу одного документа Alta."""
+    """Открывает и анализирует страницу одного документа."""
 
     page_content = await _download_page(
         document.link
@@ -120,12 +154,17 @@ async def fetch_document_details(
         fallback=document.title,
     )
 
-    full_text = _extract_main_text(soup)
+    full_text = _extract_main_text(
+        soup
+    )
 
-    status = _extract_status(full_text)
+    status = _extract_status(
+        full_text
+    )
 
     effective_date = _extract_effective_date(
-        full_text
+        full_text=full_text,
+        calendar_published=document.published,
     )
 
     excerpt = _build_text_excerpt(
@@ -135,8 +174,8 @@ async def fetch_document_details(
     )
 
     logger.info(
-        "Документ Alta прочитан: url=%s, "
-        "символов=%s, статус=%r, вступление=%r",
+        "Документ Alta прочитан: "
+        "url=%s, символов=%s, статус=%r, вступление=%r",
         document.link,
         len(full_text),
         status,
@@ -159,11 +198,11 @@ async def fetch_document_details(
 async def _download_page(
     page_url: str,
 ) -> bytes:
-    """Скачивает страницу документа с повторными попытками."""
+    """Скачивает страницу документа с повторами."""
 
     timeout = httpx.Timeout(
         connect=15.0,
-        read=35.0,
+        read=40.0,
         write=20.0,
         pool=15.0,
     )
@@ -205,6 +244,13 @@ async def _download_page(
                         "Страница документа пустая."
                     )
 
+                logger.info(
+                    "Страница документа Alta получена: "
+                    "status=%s, bytes=%s",
+                    response.status_code,
+                    len(response.content),
+                )
+
                 return response.content
 
             except (
@@ -240,11 +286,24 @@ def _extract_title(
     soup: BeautifulSoup,
     fallback: str,
 ) -> str:
-    """Получает основной заголовок документа."""
+    """Извлекает заголовок документа."""
 
-    heading = soup.find("h1")
+    selectors = (
+        "h1",
+        "main h2",
+        "article h2",
+        ".page-title",
+        ".document-title",
+    )
 
-    if heading is not None:
+    for selector in selectors:
+        heading = soup.select_one(
+            selector
+        )
+
+        if not isinstance(heading, Tag):
+            continue
+
         title = _clean_text(
             heading.get_text(
                 " ",
@@ -261,7 +320,7 @@ def _extract_title(
 def _extract_main_text(
     soup: BeautifulSoup,
 ) -> str:
-    """Извлекает видимый текст основной части страницы."""
+    """Извлекает видимый текст страницы документа."""
 
     for unwanted in soup.find_all(
         [
@@ -271,32 +330,42 @@ def _extract_main_text(
             "svg",
             "form",
             "iframe",
+            "template",
         ]
     ):
         unwanted.decompose()
 
     candidates: list[Tag] = []
 
-    for selector in (
+    selectors = (
         "main",
         "article",
         "[role='main']",
-        ".content",
         ".page-content",
+        ".document-content",
+        ".tamdoc-content",
+        ".content",
         ".b-text",
-    ):
-        element = soup.select_one(selector)
+    )
+
+    for selector in selectors:
+        element = soup.select_one(
+            selector
+        )
 
         if isinstance(element, Tag):
-            candidates.append(element)
+            candidates.append(
+                element
+            )
 
     if isinstance(soup.body, Tag):
-        candidates.append(soup.body)
+        candidates.append(
+            soup.body
+        )
 
     if not candidates:
         return ""
 
-    # Выбираем наиболее содержательный контейнер.
     main_container = max(
         candidates,
         key=lambda element: len(
@@ -316,7 +385,9 @@ def _extract_main_text(
     previous_line = ""
 
     for raw_line in raw_text.splitlines():
-        line = _clean_text(raw_line)
+        line = _clean_text(
+            raw_line
+        )
 
         if not line:
             continue
@@ -325,7 +396,9 @@ def _extract_main_text(
             continue
 
         previous_line = line
-        lines.append(line)
+        lines.append(
+            line
+        )
 
     return "\n".join(lines)
 
@@ -333,68 +406,268 @@ def _extract_main_text(
 def _extract_status(
     full_text: str,
 ) -> str:
-    """Ищет только явную отметку статуса документа."""
+    """Ищет только известные явные статусы Alta."""
 
-    known_statuses = {
-        "документ действует": "Документ действует",
-        "документ не действует": "Документ не действует",
-        "документ частично не действует": (
-            "Документ частично не действует"
-        ),
-        "статус не определен": "Статус не определён",
-        "статус не определён": "Статус не определён",
-    }
-
-    for raw_line in full_text.splitlines():
-        line = _clean_text(raw_line)
-        normalized = line.lower().strip(" .:;-")
-
-        for marker, status in known_statuses.items():
-            if normalized == marker:
-                return status
-
-    return "Не удалось определить"
-
-def _extract_effective_date(
-    full_text: str,
-) -> str:
-    """Ищет сведения о вступлении документа в силу."""
-
-    patterns = (
-        (
-            r"дата вступления в силу\s*[:\-]?\s*"
-            r"([^\n]{1,180})"
-        ),
-        (
-            r"(вступает в силу[^\n]{1,220})"
-        ),
-        (
-            r"(вступил в силу[^\n]{1,220})"
-        ),
-        (
-            r"(вступила в силу[^\n]{1,220})"
-        ),
-        (
-            r"(вступило в силу[^\n]{1,220})"
-        ),
+    lines = _prepare_lines(
+        full_text
     )
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            full_text,
+    for index, line in enumerate(lines):
+        normalized = _normalize_line(
+            line
+        )
+
+        if normalized in KNOWN_STATUSES:
+            return KNOWN_STATUSES[
+                normalized
+            ]
+
+        inline_match = re.fullmatch(
+            r"(?:статус|статус документа)\s*[:\-–—]\s*(.+)",
+            line,
             flags=re.IGNORECASE,
         )
 
-        if match:
-            value = _clean_text(
-                match.group(1)
+        if inline_match:
+            value = _normalize_line(
+                inline_match.group(1)
             )
 
-            if value:
+            if value in KNOWN_STATUSES:
+                return KNOWN_STATUSES[value]
+
+        if normalized not in {
+            "статус",
+            "статус документа",
+            "информация о статусе документа",
+        }:
+            continue
+
+        for candidate in lines[
+            index + 1:index + 4
+        ]:
+            candidate_normalized = _normalize_line(
+                candidate
+            )
+
+            if candidate_normalized in KNOWN_STATUSES:
+                return KNOWN_STATUSES[
+                    candidate_normalized
+                ]
+
+            if candidate_normalized in SERVICE_LABELS:
+                continue
+
+    return "Не удалось определить"
+
+
+def _extract_effective_date(
+    full_text: str,
+    calendar_published: str,
+) -> str:
+    """
+    Извлекает только подтверждённые сведения
+    о вступлении документа в силу.
+    """
+
+    lines = _prepare_lines(
+        full_text
+    )
+
+    calendar_dates = set(
+        DATE_PATTERN.findall(
+            calendar_published
+        )
+    )
+
+    # Вариант:
+    # «Дата вступления в силу 31.07.2026»
+    inline_label_pattern = re.compile(
+        r"^дата вступления в силу"
+        r"\s*[:\-–—]?\s*"
+        r"(.+)$",
+        flags=re.IGNORECASE,
+    )
+
+    # Формулировка из текста самого документа:
+    # «Настоящее решение вступает в силу...»
+    body_pattern = re.compile(
+        r"^(.*\bвступа(?:ет|ют|л|ла|ло|ли)"
+        r"\s+в\s+силу\b.*)$",
+        flags=re.IGNORECASE,
+    )
+
+    for index, line in enumerate(lines):
+        normalized = _normalize_line(
+            line
+        )
+
+        if _is_service_label(
+            normalized
+        ):
+            continue
+
+        inline_match = inline_label_pattern.match(
+            line
+        )
+
+        if inline_match:
+            value = _clean_text(
+                inline_match.group(1)
+            )
+
+            if _is_valid_effective_value(
+                value=value,
+                calendar_dates=calendar_dates,
+                explicit_statement=False,
+            ):
                 return value
 
-    return "Не указано"
+        body_match = body_pattern.match(
+            line
+        )
+
+        if body_match:
+            value = _clean_text(
+                body_match.group(1)
+            )
+
+            if _is_valid_effective_value(
+                value=value,
+                calendar_dates=calendar_dates,
+                explicit_statement=True,
+            ):
+                return value
+
+        if normalized not in {
+            "дата вступления в силу",
+            "вступление в силу",
+            "сведения о вступлении в силу",
+        }:
+            continue
+
+        # После заголовка принимаем только строку,
+        # похожую на дату или юридическую формулировку.
+        for candidate in lines[
+            index + 1:index + 4
+        ]:
+            candidate_normalized = _normalize_line(
+                candidate
+            )
+
+            if _is_service_label(
+                candidate_normalized
+            ):
+                continue
+
+            if _is_valid_effective_value(
+                value=candidate,
+                calendar_dates=calendar_dates,
+                explicit_statement=False,
+            ):
+                return candidate
+
+    return "Не удалось подтвердить"
+
+
+def _is_valid_effective_value(
+    value: str,
+    calendar_dates: set[str],
+    explicit_statement: bool,
+) -> bool:
+    """Проверяет найденное значение вступления в силу."""
+
+    clean_value = _clean_text(
+        value
+    )
+
+    normalized = _normalize_line(
+        clean_value
+    )
+
+    if len(clean_value) < 5:
+        return False
+
+    if _is_service_label(normalized):
+        return False
+
+    forbidden_markers = (
+        "история статусов",
+        "добавлен в базу",
+        "таможенный календарь",
+        "дата добавления",
+        "подробная информация",
+        "скачать документ",
+    )
+
+    if any(
+        marker in normalized
+        for marker in forbidden_markers
+    ):
+        return False
+
+    found_dates = set(
+        DATE_PATTERN.findall(
+            clean_value
+        )
+    )
+
+    effective_phrases = (
+        "вступает в силу",
+        "вступил в силу",
+        "вступила в силу",
+        "вступило в силу",
+        "вступили в силу",
+        "по истечении",
+        "со дня официального опубликования",
+        "с даты официального опубликования",
+        "с момента опубликования",
+    )
+
+    has_effective_phrase = any(
+        phrase in normalized
+        for phrase in effective_phrases
+    )
+
+    # Обычная соседняя строка должна содержать
+    # либо дату, либо явную формулировку.
+    if not explicit_statement:
+        if not found_dates and not has_effective_phrase:
+            return False
+
+    # Совпадение только с датой добавления в Alta
+    # не является подтверждением вступления в силу.
+    if (
+        found_dates
+        and calendar_dates
+        and found_dates.issubset(
+            calendar_dates
+        )
+        and not has_effective_phrase
+    ):
+        logger.warning(
+            "Отброшена дата календаря Alta: %s",
+            clean_value,
+        )
+        return False
+
+    return True
+
+
+def _is_service_label(
+    normalized: str,
+) -> bool:
+    """Проверяет, является ли строка элементом интерфейса."""
+
+    if normalized in SERVICE_LABELS:
+        return True
+
+    return any(
+        normalized.startswith(
+            f"{label} "
+        )
+        for label in SERVICE_LABELS
+    )
 
 
 def _build_text_excerpt(
@@ -402,30 +675,71 @@ def _build_text_excerpt(
     title: str,
     max_chars: int,
 ) -> str:
-    """Подготавливает ограниченный фрагмент для LLM."""
+    """Готовит ограниченный фрагмент текста для LLM."""
 
     text = full_text.strip()
 
     if title and text.startswith(title):
-        text = text[len(title):].strip()
+        text = text[
+            len(title):
+        ].strip()
 
     if len(text) <= max_chars:
         return text
 
     shortened = text[:max_chars]
 
-    last_paragraph = shortened.rfind("\n")
+    last_paragraph = shortened.rfind(
+        "\n"
+    )
 
     if last_paragraph > max_chars // 2:
-        shortened = shortened[:last_paragraph]
+        shortened = shortened[
+            :last_paragraph
+        ]
 
-    return shortened.rstrip() + "..."
+    return (
+        shortened.rstrip()
+        + "..."
+    )
+
+
+def _prepare_lines(
+    full_text: str,
+) -> list[str]:
+    """Разделяет текст на очищенные строки."""
+
+    lines: list[str] = []
+
+    for raw_line in full_text.splitlines():
+        line = _clean_text(
+            raw_line
+        )
+
+        if line:
+            lines.append(
+                line
+            )
+
+    return lines
+
+
+def _normalize_line(
+    value: str,
+) -> str:
+    """Нормализует строку для сравнения."""
+
+    return (
+        _clean_text(value)
+        .lower()
+        .strip(" \t\r\n.:;,-–—")
+    )
 
 
 def _clean_text(
     value: object,
 ) -> str:
-    """Очищает текст от HTML и лишних пробелов."""
+    """Очищает текст."""
 
     text = html.unescape(
         str(value or "")
@@ -437,8 +751,10 @@ def _clean_text(
         text,
     )
 
-    return re.sub(
+    text = re.sub(
         r"[ \t]+",
         " ",
         text,
-    ).strip()
+    )
+
+    return text.strip()
