@@ -3,10 +3,9 @@ import html
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Final
 from urllib.parse import urljoin, urlparse
-from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -18,8 +17,10 @@ logger = logging.getLogger(__name__)
 ALTA_BASE_URL: Final[str] = "https://www.alta.ru"
 ALTA_TAMDOC_URL: Final[str] = "https://www.alta.ru/tamdoc/"
 
-MOSCOW_TIMEZONE: Final[ZoneInfo] = ZoneInfo(
-    "Europe/Moscow"
+# Москва всегда используется как UTC+3.
+# Так код не зависит от установленной базы tzdata.
+MOSCOW_TIMEZONE: Final[timezone] = timezone(
+    timedelta(hours=3)
 )
 
 REQUEST_HEADERS: Final[dict[str, str]] = {
@@ -29,13 +30,43 @@ REQUEST_HEADERS: Final[dict[str, str]] = {
         "Chrome/150.0 Safari/537.36"
     ),
     "Accept": (
-        "text/html,"
-        "application/xhtml+xml,"
+        "text/html,application/xhtml+xml,"
         "application/xml;q=0.9,*/*;q=0.8"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
     "Referer": ALTA_TAMDOC_URL,
+    "Connection": "close",
 }
+
+
+# Возможные названия календарных разделов.
+# Используются, чтобы остановиться перед следующим разделом
+# и не захватить посторонние документы страницы.
+SECTION_MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(?:"
+    r"добавлен(?:о|ы)? в базу|"
+    r"опубликован(?:о|ы)?(?: в интернете)?|"
+    r"подписан(?:о|ы)?|"
+    r"принят(?:о|ы)?|"
+    r"дата вступления в силу|"
+    r"вступил(?:а|о|и)? в силу|"
+    r"утратил(?:а|о|и)? силу(?: с)?|"
+    r"окончание срока действия(?: с)?|"
+    r"начало действия(?: с)?"
+    r")\s+\d{2}\.\d{2}\.\d{4}$",
+    flags=re.IGNORECASE,
+)
+
+
+# Ссылка настоящего документа выглядит примерно так:
+# /tamdoc/26r00117/
+#
+# При этом исключаются календарные ссылки:
+# /tamdoc/2026_07_23/
+DOCUMENT_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^/tamdoc/(?!\d{4}_\d{2}_\d{2}/?$)[^/?#]+/?$",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -55,18 +86,20 @@ async def fetch_alta_documents(
     target_date: date | None = None,
 ) -> list[AltaDocument]:
     """
-    Получает документы из раздела «Добавлен в базу»
-    Таможенного календаря Alta.
+    Получает документы только из точного раздела:
 
-    По умолчанию используется текущая дата по Москве.
+    «Добавлен в базу ДД.ММ.ГГГГ».
+
+    По умолчанию проверяется текущая дата по Москве.
     """
 
     if limit <= 0:
         return []
 
-    calendar_date = target_date or datetime.now(
-        MOSCOW_TIMEZONE
-    ).date()
+    calendar_date = (
+        target_date
+        or datetime.now(MOSCOW_TIMEZONE).date()
+    )
 
     calendar_url = build_calendar_url(
         calendar_date
@@ -100,7 +133,7 @@ async def fetch_alta_documents(
 def build_calendar_url(
     calendar_date: date,
 ) -> str:
-    """Формирует ссылку на выбранный день календаря."""
+    """Формирует ссылку на календарь за конкретный день."""
 
     return (
         f"{ALTA_TAMDOC_URL}"
@@ -114,8 +147,8 @@ def _parse_added_documents(
     calendar_date: date,
 ) -> list[AltaDocument]:
     """
-    Находит раздел «Добавлен в базу»
-    и извлекает документы до следующего заголовка.
+    Извлекает ссылки исключительно из нужного
+    календарного блока.
     """
 
     soup = BeautifulSoup(
@@ -123,72 +156,68 @@ def _parse_added_documents(
         "html.parser",
     )
 
-    added_heading = _find_added_heading(soup)
+    located = _locate_added_section(
+        soup=soup,
+        calendar_date=calendar_date,
+        calendar_url=calendar_url,
+    )
 
-    if added_heading is None:
+    if located is None:
         logger.info(
-            "Раздел «Добавлен в базу» отсутствует: %s",
+            "Точный блок «Добавлен в базу %s» "
+            "не найден: %s",
+            calendar_date.strftime("%d.%m.%Y"),
             calendar_url,
         )
         return []
 
+    marker, container = located
+
+    anchors = _collect_document_anchors(
+        marker=marker,
+        container=container,
+        calendar_url=calendar_url,
+    )
+
     documents: list[AltaDocument] = []
     seen_links: set[str] = set()
 
-    for element in added_heading.next_elements:
-        if element is added_heading:
-            continue
-
-        # Следующий заголовок означает конец нужного раздела.
-        if (
-            isinstance(element, Tag)
-            and element.name
-            in {"h1", "h2", "h3", "h4"}
-        ):
-            break
-
-        if not (
-            isinstance(element, Tag)
-            and element.name == "a"
-        ):
-            continue
-
+    for anchor in anchors:
         href = str(
-            element.get("href") or ""
+            anchor.get("href") or ""
         ).strip()
 
-        if not href:
-            continue
-
-        link = urljoin(
-            ALTA_BASE_URL,
-            href,
+        link = _normalize_url(
+            urljoin(
+                ALTA_BASE_URL,
+                href,
+            )
         )
 
-        if not _is_document_link(
-            link=link,
-            calendar_url=calendar_url,
-        ):
+        if not link:
             continue
 
         if link in seen_links:
             continue
 
         title = _clean_text(
-            element.get_text(
+            anchor.get_text(
                 " ",
                 strip=True,
             )
         )
 
-        if not title:
+        # Отбрасываем пустые и служебные подписи.
+        if len(title) < 8:
             continue
 
         seen_links.add(link)
 
         summary = _extract_document_summary(
-            link_element=element,
+            link_element=anchor,
+            section_container=container,
             title=title,
+            calendar_url=calendar_url,
         )
 
         documents.append(
@@ -205,125 +234,480 @@ def _parse_added_documents(
             )
         )
 
+    logger.info(
+        "Из точного блока «Добавлен в базу» "
+        "извлечено документов: %s",
+        len(documents),
+    )
+
+    for document in documents:
+        logger.info(
+            "Документ календаря: %s | %s",
+            document.title,
+            document.link,
+        )
+
     return documents
 
 
-def _find_added_heading(
+def _locate_added_section(
     soup: BeautifulSoup,
-) -> Tag | None:
-    """Ищет заголовок «Добавлен в базу»."""
+    calendar_date: date,
+    calendar_url: str,
+) -> tuple[Tag, Tag] | None:
+    """
+    Находит точную надпись «Добавлен в базу ДД.ММ.ГГГГ»
+    и минимальный HTML-контейнер с её документами.
+    """
 
-    for heading in soup.find_all(
-        ["h1", "h2", "h3", "h4"]
-    ):
-        heading_text = _clean_text(
-            heading.get_text(
-                " ",
-                strip=True,
+    expected = (
+        "добавлен в базу "
+        f"{calendar_date:%d.%m.%Y}"
+    )
+
+    candidates: list[Tag] = []
+
+    for tag in soup.find_all(True):
+        text = _normalized_lower_text(tag)
+
+        if text != expected:
+            continue
+
+        # Иногда один и тот же текст содержат:
+        # span, div и несколько родительских блоков.
+        # Оставляем самый узкий элемент.
+        has_same_text_child = any(
+            isinstance(child, Tag)
+            and _normalized_lower_text(child) == expected
+            for child in tag.find_all(
+                recursive=False
             )
-        ).lower()
+        )
 
-        if heading_text.startswith(
-            "добавлен в базу"
+        if not has_same_text_child:
+            candidates.append(tag)
+
+    candidates.sort(
+        key=lambda tag: len(
+            tag.find_all(True)
+        )
+    )
+
+    located_sections: list[
+        tuple[int, Tag, Tag]
+    ] = []
+
+    for marker in candidates:
+        container = _find_section_container(
+            marker=marker,
+            expected_marker=expected,
+            calendar_url=calendar_url,
+        )
+
+        if container is None:
+            continue
+
+        anchors = _collect_document_anchors(
+            marker=marker,
+            container=container,
+            calendar_url=calendar_url,
+        )
+
+        if not anchors:
+            continue
+
+        located_sections.append(
+            (
+                len(
+                    container.find_all(True)
+                ),
+                marker,
+                container,
+            )
+        )
+
+    if not located_sections:
+        return None
+
+    # Берём самый маленький валидный контейнер.
+    # Это не позволяет захватить общий фон страницы.
+    _, marker, container = min(
+        located_sections,
+        key=lambda item: item[0],
+    )
+
+    logger.info(
+        "Найден блок календаря Alta: "
+        "tag=%s, classes=%s",
+        container.name,
+        container.get("class"),
+    )
+
+    return marker, container
+
+
+def _find_section_container(
+    marker: Tag,
+    expected_marker: str,
+    calendar_url: str,
+) -> Tag | None:
+    """
+    Поднимается от текста заголовка к ближайшему
+    контейнеру, содержащему документы этого события.
+    """
+
+    current: Tag | None = marker
+
+    for _ in range(12):
+        if current is None:
+            break
+
+        marker_texts = (
+            _find_section_marker_texts(
+                current
+            )
+        )
+
+        document_links: set[str] = set()
+
+        for anchor in current.find_all(
+            "a",
+            href=True,
         ):
-            return heading
+            href = str(
+                anchor.get("href") or ""
+            ).strip()
+
+            link = _normalize_url(
+                urljoin(
+                    ALTA_BASE_URL,
+                    href,
+                )
+            )
+
+            if _is_document_link(
+                link=link,
+                calendar_url=calendar_url,
+            ):
+                document_links.add(link)
+
+        # Валидный контейнер:
+        # 1. содержит хотя бы один документ;
+        # 2. содержит разумное количество ссылок;
+        # 3. содержит только наш календарный заголовок;
+        # 4. не содержит другие разделы страницы.
+        if (
+            1 <= len(document_links) <= 20
+            and marker_texts == {
+                expected_marker
+            }
+        ):
+            return current
+
+        parent = current.parent
+
+        current = (
+            parent
+            if isinstance(parent, Tag)
+            else None
+        )
 
     return None
+
+
+def _find_section_marker_texts(
+    container: Tag,
+) -> set[str]:
+    """
+    Находит календарные заголовки внутри контейнера.
+
+    Например:
+    - добавлен в базу 23.07.2026;
+    - опубликован в интернете 23.07.2026;
+    - дата вступления в силу 23.07.2026.
+    """
+
+    result: set[str] = set()
+
+    for tag in container.find_all(True):
+        # Большой родитель содержит весь текст блока,
+        # поэтому рассматриваем только компактные теги.
+        if len(tag.find_all(True)) > 8:
+            continue
+
+        text = _normalized_lower_text(
+            tag
+        )
+
+        if SECTION_MARKER_PATTERN.fullmatch(
+            text
+        ):
+            result.add(text)
+
+    own_text = _normalized_lower_text(
+        container
+    )
+
+    if (
+        len(container.find_all(True)) <= 8
+        and SECTION_MARKER_PATTERN.fullmatch(
+            own_text
+        )
+    ):
+        result.add(own_text)
+
+    return result
+
+
+def _collect_document_anchors(
+    marker: Tag,
+    container: Tag,
+    calendar_url: str,
+) -> list[Tag]:
+    """
+    Собирает ссылки, расположенные только после
+    заголовка внутри выбранного контейнера.
+    """
+
+    anchors: list[Tag] = []
+    seen_links: set[str] = set()
+
+    started = False
+
+    for element in container.descendants:
+        if element is marker:
+            started = True
+            continue
+
+        if not started:
+            continue
+
+        if not isinstance(element, Tag):
+            continue
+
+        # Если внутри контейнера начался следующий
+        # календарный раздел — прекращаем чтение.
+        if (
+            element is not marker
+            and len(
+                element.find_all(True)
+            ) <= 8
+        ):
+            element_text = (
+                _normalized_lower_text(
+                    element
+                )
+            )
+
+            if SECTION_MARKER_PATTERN.fullmatch(
+                element_text
+            ):
+                break
+
+        if element.name != "a":
+            continue
+
+        href = str(
+            element.get("href") or ""
+        ).strip()
+
+        link = _normalize_url(
+            urljoin(
+                ALTA_BASE_URL,
+                href,
+            )
+        )
+
+        if not _is_document_link(
+            link=link,
+            calendar_url=calendar_url,
+        ):
+            continue
+
+        if link in seen_links:
+            continue
+
+        seen_links.add(link)
+        anchors.append(element)
+
+    return anchors
 
 
 def _is_document_link(
     link: str,
     calendar_url: str,
 ) -> bool:
-    """Отделяет ссылки документов от служебных ссылок."""
+    """
+    Проверяет, что ссылка ведёт на документ Alta,
+    а не на календарь, поиск или внешний сайт.
+    """
 
-    normalized_link = link.split("#", maxsplit=1)[0]
-    normalized_calendar = calendar_url.rstrip("/") + "/"
+    normalized_link = _normalize_url(
+        link
+    )
 
-    if (
-        normalized_link.rstrip("/") + "/"
-        == normalized_calendar
-    ):
+    normalized_calendar = _normalize_url(
+        calendar_url
+    )
+
+    if not normalized_link:
         return False
 
-    path = urlparse(
+    if normalized_link == normalized_calendar:
+        return False
+
+    parsed = urlparse(
         normalized_link
-    ).path
+    )
 
-    if not path.startswith("/tamdoc/"):
-        return False
-
-    # Не принимаем корень, поиск и страницы календарных дат.
-    if path.rstrip("/") in {
-        "/tamdoc",
-        "/tamdoc/search",
+    if parsed.netloc and parsed.netloc not in {
+        "alta.ru",
+        "www.alta.ru",
     }:
         return False
 
-    if re.fullmatch(
-        r"/tamdoc/\d{4}_\d{2}_\d{2}/?",
-        path,
-    ):
-        return False
-
-    return True
+    return bool(
+        DOCUMENT_PATH_PATTERN.fullmatch(
+            parsed.path
+        )
+    )
 
 
 def _extract_document_summary(
     link_element: Tag,
+    section_container: Tag,
     title: str,
+    calendar_url: str,
 ) -> str:
     """
-    Получает краткое пояснение, расположенное
-    рядом с названием документа.
+    Извлекает краткое описание из ближайшей
+    карточки конкретного документа.
     """
 
-    list_item = link_element.find_parent("li")
+    current = link_element.parent
+    best_text = ""
 
-    if list_item is None:
-        return ""
+    for _ in range(7):
+        if not isinstance(current, Tag):
+            break
 
-    item_text = _clean_text(
-        list_item.get_text(
-            " ",
-            strip=True,
+        if current is section_container:
+            break
+
+        document_anchors = []
+
+        for anchor in current.find_all(
+            "a",
+            href=True,
+        ):
+            href = str(
+                anchor.get("href") or ""
+            ).strip()
+
+            link = urljoin(
+                ALTA_BASE_URL,
+                href,
+            )
+
+            if _is_document_link(
+                link=link,
+                calendar_url=calendar_url,
+            ):
+                document_anchors.append(
+                    anchor
+                )
+
+        text = _clean_text(
+            current.get_text(
+                " ",
+                strip=True,
+            )
         )
-    )
 
-    if item_text.startswith(title):
-        item_text = item_text[
-            len(title):
-        ].strip(" ;—–-")
+        # Карточка должна содержать только одну
+        # ссылку на нормативный документ.
+        if (
+            len(document_anchors) == 1
+            and len(text) > len(title)
+        ):
+            best_text = text
+            break
 
-    if item_text == title:
+        parent = current.parent
+
+        current = (
+            parent
+            if isinstance(parent, Tag)
+            else None
+        )
+
+    if not best_text:
+        # На некоторых страницах описание может идти
+        # отдельным соседним элементом.
+        parent = link_element.parent
+
+        if isinstance(parent, Tag):
+            sibling = parent.find_next_sibling()
+
+            if isinstance(sibling, Tag):
+                sibling_text = _clean_text(
+                    sibling.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+
+                if (
+                    sibling_text
+                    and not SECTION_MARKER_PATTERN.fullmatch(
+                        sibling_text.lower()
+                    )
+                ):
+                    best_text = sibling_text
+
+    if not best_text:
         return ""
 
-    if len(item_text) > 700:
-        item_text = (
-            item_text[:697].rstrip()
+    if best_text.startswith(title):
+        best_text = best_text[
+            len(title):
+        ].strip(" ;—–-:")
+
+    if best_text == title:
+        return ""
+
+    if len(best_text) > 700:
+        best_text = (
+            best_text[:697].rstrip()
             + "..."
         )
 
-    return item_text
+    return best_text
 
 
 async def _download_page(
     page_url: str,
 ) -> bytes:
-    """Скачивает страницу с повторными попытками."""
+    """
+    Скачивает страницу Alta.
+
+    Сначала пробует системные настройки сети,
+    затем прямое соединение без системного прокси.
+    """
 
     timeout = httpx.Timeout(
         connect=15.0,
-        read=30.0,
+        read=35.0,
         write=20.0,
         pool=15.0,
     )
 
     last_error: Exception | None = None
 
-    # Сначала используем настройки Windows/VPN,
-    # затем пробуем прямое соединение.
-    for trust_env in (True, False):
+    for trust_env in (
+        True,
+        False,
+    ):
         mode_name = (
             "с системными настройками"
             if trust_env
@@ -396,10 +780,45 @@ async def _download_page(
     )
 
 
+def _normalize_url(
+    value: str,
+) -> str:
+    """Удаляет fragment и нормализует адрес."""
+
+    if not value:
+        return ""
+
+    parsed = urlparse(
+        value
+    )
+
+    path = parsed.path or "/"
+
+    return parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        path=path,
+        fragment="",
+    ).geturl()
+
+
+def _normalized_lower_text(
+    tag: Tag,
+) -> str:
+    """Возвращает очищенный текст тега в нижнем регистре."""
+
+    return _clean_text(
+        tag.get_text(
+            " ",
+            strip=True,
+        )
+    ).lower()
+
+
 def _clean_text(
     value: object,
 ) -> str:
-    """Удаляет HTML и лишние пробелы."""
+    """Удаляет HTML-сущности и лишние пробелы."""
 
     text = html.unescape(
         str(value or "")
