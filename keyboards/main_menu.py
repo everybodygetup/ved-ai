@@ -27,6 +27,10 @@ main_menu = ReplyKeyboardMarkup(
                 text="📞 Консультация"
             ),
         ],
+        [
+            KeyboardButton(text="🔔 Подписаться"),
+            KeyboardButton(text="🔕 Отписаться"),
+        ],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",

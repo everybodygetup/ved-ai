@@ -1,6 +1,12 @@
 import asyncio
 import logging
-
+from handlers.subscriptions import (
+    router as subscriptions_router,
+)
+from monitoring.worker import (
+    start_monitor_worker,
+    stop_monitor_worker,
+)
 from aiogram import Bot, Dispatcher
 
 from config.settings import BOT_TOKEN
@@ -24,8 +30,15 @@ async def main() -> None:
     autoparts_router,
     files_router,
     monitor_router,
+    subscriptions_router,
+)
+    dispatcher.startup.register(
+    start_monitor_worker
 )
 
+    dispatcher.shutdown.register(
+    stop_monitor_worker
+)
     logging.info("Бот запущен")
 
     await dispatcher.start_polling(bot)

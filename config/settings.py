@@ -35,3 +35,17 @@ if not OPENROUTER_API_KEY.isascii():
     raise RuntimeError(
         "OPENROUTER_API_KEY содержит недопустимые символы."
     )
+try:
+    MONITOR_INTERVAL_SECONDS = max(
+        60,
+        int(
+            os.getenv(
+                "MONITOR_INTERVAL_SECONDS",
+                "3600",
+            )
+        ),
+    )
+except ValueError as error:
+    raise RuntimeError(
+        "MONITOR_INTERVAL_SECONDS должен быть целым числом."
+    ) from error
