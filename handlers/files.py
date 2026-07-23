@@ -5,6 +5,7 @@ from pathlib import Path
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     Message,
     ReplyKeyboardRemove,
@@ -21,8 +22,11 @@ from services.file_parser import (
     parse_uploaded_file,
 )
 from services.llm import ask_llm
+from services.report_builder import (
+    build_excel_report,
+    build_report_filename,
+)
 from states.file_state import FileState
-
 
 logger = logging.getLogger(__name__)
 
@@ -150,12 +154,16 @@ async def process_uploaded_document(
 
     # Сохраняем подготовленный текст в памяти FSM.
     await state.update_data(
-        file_analysis_request=analysis_request,
-    )
+    file_analysis_request=analysis_request,
+    file_type=result.file_type,
+    file_name=result.filename,
+    file_records=result.records,
+    file_warnings=result.warnings,
+)
 
     await state.set_state(
-        FileState.waiting_confirmation
-    )
+    FileState.waiting_confirmation
+)
 
     await _send_long_message(
         message=message,
@@ -190,7 +198,7 @@ async def analyze_file(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
-    """Отправляет обезличенную сводку в LLM."""
+    """Запускает AI-анализ и возвращает готовый Excel-отчёт."""
 
     await callback.answer()
 
@@ -202,23 +210,44 @@ async def analyze_file(
 
     data = await state.get_data()
 
-    analysis_request = data.get(
-        "file_analysis_request"
+    logger.info(
+        "FSM перед анализом: ключи=%s",
+        list(data.keys()),
+    )
+
+    analysis_request = data.get("file_analysis_request")
+    source_filename = data.get("file_name") or "uploaded_file.xlsx"
+    records = data.get("file_records") or []
+    warnings = data.get("file_warnings") or []
+
+    logger.info(
+        "Данные отчёта: файл=%r, позиций=%s, предупреждений=%s",
+        source_filename,
+        len(records),
+        len(warnings),
     )
 
     if not analysis_request:
         await state.clear()
 
         await message.answer(
-            "Не удалось найти результаты обработки.\n"
-            "Загрузите файл повторно.",
+            "Не найдена сводка для анализа. "
+            "Загрузите Excel заново.",
             reply_markup=main_menu,
         )
         return
 
-    await message.edit_reply_markup(
-        reply_markup=None
-    )
+    if not records:
+        await state.clear()
+
+        await message.answer(
+            "Позиции Excel не сохранились в памяти. "
+            "Загрузите файл заново.",
+            reply_markup=main_menu,
+        )
+        return
+
+    await message.edit_reply_markup(reply_markup=None)
 
     await message.answer(
         "🔎 Анализирую найденные позиции..."
@@ -235,26 +264,73 @@ async def analyze_file(
 
     except APITimeoutError:
         analysis = (
-            "⏳ Бесплатная модель отвечает слишком долго.\n\n"
-            "Попробуйте повторить анализ позднее."
+            "Бесплатная модель не успела ответить вовремя. "
+            "Excel-отчёт будет сформирован без AI-анализа."
         )
 
     except Exception:
         logger.exception(
-            "Ошибка AI-анализа загруженного файла"
+            "Ошибка AI-анализа файла"
         )
 
         analysis = (
-            "⚠️ AI-анализ сейчас недоступен.\n\n"
-            "Локальная проверка файла выполнена успешно."
+            "AI-анализ временно недоступен. "
+            "Отчёт сформирован по локальным проверкам."
         )
-
-    await state.clear()
 
     await _send_long_message(
         message=message,
         text=analysis,
     )
+
+    try:
+        report_bytes = await asyncio.to_thread(
+            build_excel_report,
+            source_filename,
+            records,
+            warnings,
+            analysis,
+        )
+
+        report_filename = build_report_filename(
+            source_filename
+        )
+
+        logger.info(
+            "Excel создан: %s, размер=%s байт",
+            report_filename,
+            len(report_bytes),
+        )
+
+        report_document = BufferedInputFile(
+            file=report_bytes,
+            filename=report_filename,
+        )
+
+        await message.answer_document(
+            document=report_document,
+            caption=(
+                "📊 Excel-отчёт с результатами "
+                "предварительной проверки."
+            ),
+        )
+
+        logger.info(
+            "Excel успешно отправлен пользователю"
+        )
+
+    except Exception:
+        logger.exception(
+            "Ошибка создания или отправки Excel-отчёта"
+        )
+
+        await message.answer(
+            "⚠️ Текстовый анализ выполнен, но при создании "
+            "или отправке Excel возникла ошибка. "
+            "Посмотрите последние строки терминала."
+        )
+
+    await state.clear()
 
     await message.answer(
         "✅ Анализ завершён.",
