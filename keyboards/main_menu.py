@@ -14,6 +14,9 @@ main_menu = ReplyKeyboardMarkup(
             KeyboardButton(text="📄 Проверить документы")
         ],
         [
+            KeyboardButton(text="📄 Проверить файл"),
+        ],
+        [
             KeyboardButton(text="📞 Консультация"),
         ],
     ],

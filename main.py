@@ -6,7 +6,7 @@ from aiogram import Bot, Dispatcher
 from config.settings import BOT_TOKEN
 from handlers.autoparts import router as autoparts_router
 from handlers.start import router as start_router
-
+from handlers.files import router as files_router
 
 async def main() -> None:
     logging.basicConfig(
@@ -18,8 +18,9 @@ async def main() -> None:
     dispatcher = Dispatcher()
 
     dispatcher.include_routers(
-        start_router,
-        autoparts_router,
+    start_router,
+    autoparts_router,
+    files_router,
     )
 
     logging.info("Бот запущен")
