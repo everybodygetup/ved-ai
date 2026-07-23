@@ -3,6 +3,9 @@ from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 
 from states.import_state import ImportState
+from keyboards.company_type import company_keyboard
+from services.summary import build_summary
+
 
 from data.messages import (
     ASK_COUNTRY,
@@ -28,7 +31,10 @@ async def process_country(message: Message, state: FSMContext):
 
     await state.set_state(ImportState.company_type)
 
-    await message.answer(ASK_COMPANY)
+    await message.answer(
+    ASK_COMPANY,
+    reply_markup=company_keyboard,
+)
 
 @router.message(ImportState.company_type)
 async def process_company(message: Message, state: FSMContext):
@@ -46,16 +52,7 @@ async def process_product(message: Message, state: FSMContext):
 
     data = await state.get_data()
 
-    await message.answer(
-    f"""{SUMMARY}
-
-🌍 Страна: {data["country"]}
-
-🏢 Получатель: {data["company_type"]}
-
-📦 Товар: {data["product"]}
-"""
-)
+    await message.answer(build_summary(data))
 
 
 async def autoparts_handler(message: Message):
