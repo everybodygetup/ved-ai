@@ -5,6 +5,11 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import LinkPreviewOptions
 
+from monitoring.document_reader import (
+    AltaDocumentDetails,
+    fetch_documents_details,
+)
+
 from config.settings import MONITOR_INTERVAL_SECONDS
 from monitoring.alta import (
     AltaDocument,
@@ -202,12 +207,20 @@ async def _check_and_notify(
 async def _build_notification(
     documents: list[AltaDocument],
 ) -> str:
-    """Формирует LLM-дайджест и список документов."""
+    """
+    Читает страницы документов,
+    формирует доказательный LLM-дайджест.
+    """
 
     documents_for_digest = documents[:10]
 
+    details = await fetch_documents_details(
+        documents_for_digest,
+        max_documents=10,
+    )
+
     prompt = _build_digest_prompt(
-        documents_for_digest
+        details
     )
 
     try:
@@ -220,49 +233,61 @@ async def _build_notification(
 
         digest = (
             "Найдены новые документы в Таможенном "
-            "календаре Alta. AI-анализ временно недоступен, "
-            "поэтому проверьте названия и тексты документов "
-            "по ссылкам ниже."
+            "календаре Alta.\n\n"
+            "AI-анализ временно недоступен. "
+            "Проверьте документы по ссылкам ниже."
         )
 
-    if len(digest) > 2500:
+    if len(digest) > 2800:
         digest = (
-            digest[:2497].rstrip()
+            digest[:2797].rstrip()
             + "..."
         )
 
     lines = [
-        "🆕 ОБНОВЛЕНИЕ ПО ВЭД",
+        "🆕 ДОКУМЕНТЫ, ДОБАВЛЕННЫЕ В БАЗУ ALTA",
         "",
         digest,
         "",
-        "📚 Новые документы:",
+        "📚 Добавленные документы:",
     ]
 
-    for number, document in enumerate(
-        documents_for_digest,
+    for number, detail in enumerate(
+        details,
         start=1,
     ):
         lines.extend(
             [
                 "",
-                f"{number}. {document.title}",
-                document.link,
+                f"{number}. {detail.title}",
             ]
         )
 
-    if len(documents) > len(documents_for_digest):
+        if detail.status != "Не указан":
+            lines.append(
+                f"Статус: {detail.status}"
+            )
+
+        if detail.effective_date != "Не указано":
+            lines.append(
+                "Вступление в силу: "
+                f"{detail.effective_date}"
+            )
+
+        lines.append(detail.link)
+
+    if len(documents) > len(details):
         lines.extend(
             [
                 "",
                 "Дополнительно найдено документов: "
-                f"{len(documents) - len(documents_for_digest)}.",
+                f"{len(documents) - len(details)}.",
             ]
         )
 
     calendar_link = (
-        documents_for_digest[0].calendar_link
-        if documents_for_digest
+        details[0].calendar_link
+        if details
         else ""
     )
 
@@ -286,25 +311,42 @@ async def _build_notification(
 
 
 def _build_digest_prompt(
-    documents: list[AltaDocument],
+    documents: list[AltaDocumentDetails],
 ) -> str:
-    """Создаёт запрос для анализа новых документов."""
+    """Создаёт доказательный запрос для анализа документов."""
 
-    lines = [
-        "Сформируй краткий профессиональный дайджест "
-        "новых документов по ВЭД.",
+    lines = [        "",
+        "Важно: документы являются новыми только для базы Alta.",
+        "Это не означает, что они недавно приняты, изменены "
+        "или вступили в силу.",
+        "Не называй документ новым нормативным изменением, "
+        "если это прямо не следует из его текста.",
+        "Ты анализируешь новые документы по ВЭД.",
         "",
-        "Используй только сведения ниже.",
-        "Не придумывай содержание документов, даты "
-        "вступления в силу, коды товаров и последствия.",
+        "Используй только факты, приведённые ниже.",
+        "Запрещено придумывать содержание документа, "
+        "сроки, коды ТН ВЭД, ставки, последствия "
+        "и категории товаров.",
         "",
-        "Для Telegram дай:",
-        "1. Что опубликовано.",
-        "2. Кому это потенциально важно.",
-        "3. Что необходимо проверить вручную.",
-        "4. Приоритет: важно или справочно.",
+        "Если конкретное изменение не видно из текста, "
+        "напиши: «Недостаточно данных для вывода».",
         "",
-        "Если данных недостаточно, прямо так и напиши.",
+        "Сформируй короткий дайджест для Telegram.",
+        "",
+        "По каждому документу укажи:",
+        "1. Приоритет: 🔴 критично, 🟡 важно или 🟢 справочно.",
+        "2. Что это за документ.",
+        "3.Есть ли фактическое новое изменение законодательства. "
+         "Если документ старый и лишь добавлен в базу Alta, "
+         "прямо так и напиши."
+        "4. Кого потенциально касается.",
+        "5. Статус и вступление в силу.",
+        "6. Что проверить специалисту по ВЭД.",
+        "",
+        "Красный приоритет используй только при наличии "
+        "конкретного подтверждённого основания.",
+        "",
+        "Не используй таблицы, HTML и Markdown-заголовки.",
         "",
         "Документы:",
     ]
@@ -316,20 +358,34 @@ def _build_digest_prompt(
         lines.extend(
             [
                 "",
-                f"{number}. Название: {document.title}",
-                f"Описание: {document.summary or 'не указано'}",
-                f"Дата: {document.published}",
+                f"ДОКУМЕНТ {number}",
+                f"Название: {document.title}",
+                f"Добавлен в базу: {document.published}",
+                f"Статус: {document.status}",
+                "Сведения о вступлении в силу: "
+                f"{document.effective_date}",
+                "Краткое описание из календаря: "
+                f"{document.calendar_summary or 'не указано'}",
+                "Фрагмент страницы документа:",
+                (
+                    document.text_excerpt
+                    or "Текст извлечь не удалось."
+                ),
             ]
         )
 
+        if document.extraction_error:
+            lines.append(
+                "Ошибка извлечения: "
+                f"{document.extraction_error}"
+            )
+
     return "\n".join(lines)
-
-
 def _split_message(
     text: str,
     chunk_size: int = 3900,
 ) -> list[str]:
-    """Делит длинный текст на сообщения Telegram."""
+    """Делит длинный текст на части для Telegram."""
 
     parts: list[str] = []
     remaining = text.strip()
